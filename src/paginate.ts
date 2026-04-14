@@ -39,6 +39,7 @@ import {
     quoteVirtualColumn,
     RelationSchema,
     RelationSchemaInput,
+    resolveJsonbPath,
     SortBy,
 } from './helper'
 import globalConfig from './global-config'
@@ -691,19 +692,34 @@ export async function paginate<T extends ObjectLiteral>(
             const { isVirtualProperty, query: virtualQuery } = extractVirtualProperty(queryBuilder, columnProperties)
             const isRelation = checkIsRelation(queryBuilder, columnProperties.propertyPath)
             const isEmbedded = checkIsEmbedded(queryBuilder, columnProperties.propertyPath)
-            let alias = fixColumnAlias(columnProperties, queryBuilder.alias, isRelation, isVirtualProperty, isEmbedded, undefined, queryBuilder)
+            const jsonbResolution = resolveJsonbPath(queryBuilder, columnProperties.column)
+            const isJsonbPath = jsonbResolution.isJsonb && jsonbResolution.jsonPath.length > 0
 
-            if (isVirtualProperty && virtualQuery && !isMySqlOrMariaDb) {
-                const subqueryExpr = fixColumnAlias(
-                    columnProperties,
-                    queryBuilder.alias,
-                    isRelation,
-                    isVirtualProperty,
-                    isEmbedded,
-                    virtualQuery,
-                    queryBuilder
-                )
-                const vcSortAlias = `${alias}_vc_sort`.toLowerCase()
+            let alias = fixColumnAlias(
+                columnProperties,
+                queryBuilder.alias,
+                isRelation,
+                isVirtualProperty,
+                isEmbedded,
+                undefined,
+                queryBuilder
+            )
+
+            if ((isVirtualProperty && virtualQuery && !isMySqlOrMariaDb) || isJsonbPath) {
+                const subqueryExpr = isJsonbPath
+                    ? alias // fixColumnAlias already returns the extraction expression
+                    : fixColumnAlias(
+                          columnProperties,
+                          queryBuilder.alias,
+                          isRelation,
+                          isVirtualProperty,
+                          isEmbedded,
+                          virtualQuery,
+                          queryBuilder
+                      )
+                const vcSortAlias = isJsonbPath
+                    ? `${queryBuilder.alias}_jsonb_${columnProperties.column.replace(/[^a-zA-Z0-9]/g, '_')}_sort`.toLowerCase()
+                    : `${alias}_vc_sort`.toLowerCase()
                 queryBuilder.addSelect(subqueryExpr, vcSortAlias)
                 alias = vcSortAlias
             } else if (isVirtualProperty) {
