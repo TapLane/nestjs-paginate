@@ -142,7 +142,8 @@ function flattenWhereAndTransform<T>(
                     isRelation,
                     isVirtualProperty,
                     isEmbedded,
-                    virtualQuery
+                    virtualQuery,
+                    queryBuilder
                 )
                 const whereClause = queryBuilder['createWhereConditionExpression'](
                     queryBuilder['getWherePredicateCondition'](alias, value)
@@ -598,7 +599,8 @@ export async function paginate<T extends ObjectLiteral>(
                     isRelation,
                     isVirtualProperty,
                     isEmbedded,
-                    virtualQuery
+                    virtualQuery,
+                    queryBuilder
                 )
 
                 // Find column metadata to determine type for proper cursor handling
@@ -689,7 +691,7 @@ export async function paginate<T extends ObjectLiteral>(
             const { isVirtualProperty, query: virtualQuery } = extractVirtualProperty(queryBuilder, columnProperties)
             const isRelation = checkIsRelation(queryBuilder, columnProperties.propertyPath)
             const isEmbedded = checkIsEmbedded(queryBuilder, columnProperties.propertyPath)
-            let alias = fixColumnAlias(columnProperties, queryBuilder.alias, isRelation, isVirtualProperty, isEmbedded)
+            let alias = fixColumnAlias(columnProperties, queryBuilder.alias, isRelation, isVirtualProperty, isEmbedded, undefined, queryBuilder)
 
             if (isVirtualProperty && virtualQuery && !isMySqlOrMariaDb) {
                 const subqueryExpr = fixColumnAlias(
@@ -698,7 +700,8 @@ export async function paginate<T extends ObjectLiteral>(
                     isRelation,
                     isVirtualProperty,
                     isEmbedded,
-                    virtualQuery
+                    virtualQuery,
+                    queryBuilder
                 )
                 const vcSortAlias = `${alias}_vc_sort`.toLowerCase()
                 queryBuilder.addSelect(subqueryExpr, vcSortAlias)
@@ -815,7 +818,7 @@ export async function paginate<T extends ObjectLiteral>(
         let cols: string[] = selectParams.reduce((cols, currentCol) => {
             const columnProperties = getPropertiesByColumnName(currentCol)
             const isRelation = checkIsRelation(queryBuilder, columnProperties.propertyPath)
-            cols.push(fixColumnAlias(columnProperties, queryBuilder.alias, isRelation))
+            cols.push(fixColumnAlias(columnProperties, queryBuilder.alias, isRelation, false, false, undefined, queryBuilder))
             return cols
         }, [])
 
@@ -862,7 +865,8 @@ export async function paginate<T extends ObjectLiteral>(
                             isRelation,
                             isVirtualProperty,
                             isEmbedded,
-                            virtualQuery
+                            virtualQuery,
+                            qb
                         )
 
                         const condition: WherePredicateOperator = {
@@ -898,7 +902,8 @@ export async function paginate<T extends ObjectLiteral>(
                                         isRelation,
                                         isVirtualProperty,
                                         isEmbedded,
-                                        virtualQuery
+                                        virtualQuery,
+                                        subQb
                                     )
 
                                     const condition: WherePredicateOperator = {
