@@ -15,10 +15,12 @@ function isExpressRequest(request: unknown): request is ExpressRequest {
 export interface PaginateQuery {
     page?: number
     limit?: number
-    sortBy?: [string, string][]
+    sortBy?: [string | string[], string][]
     searchBy?: string[]
     search?: string
     filter?: { [column: string]: string | string[] }
+    /** Boolean filter expression from a single `filter=` query parameter. */
+    filterExpression?: string
     select?: string[]
     cursor?: string
     withDeleted?: boolean
@@ -96,7 +98,9 @@ export const Paginate = createParamDecorator((_data: unknown, ctx: ExecutionCont
     }
 
     const searchBy = parseParam<string>(query.searchBy, singleSplit)
-    const sortBy = parseParam<[string, string]>(query.sortBy, multipleSplit)
+    const sortBy = parseParam<[string, string]>(query.sortBy, multipleSplit)?.map(
+        ([column, order]) => [column.includes('~') ? column.split('~') : column, order] as [string | string[], string]
+    )
     const select = parseParam<string>(query.select, multipleAndCommaSplit)
 
     const filter = mapKeys(
@@ -116,6 +120,7 @@ export const Paginate = createParamDecorator((_data: unknown, ctx: ExecutionCont
         search: query.search ? query.search.toString() : undefined,
         searchBy,
         filter: Object.keys(filter).length ? filter : undefined,
+        filterExpression: isString(query.filter) ? query.filter : undefined,
         select,
         cursor: query.cursor ? query.cursor.toString() : undefined,
         withDeleted: query.withDeleted === 'true' ? true : query.withDeleted === 'false' ? false : undefined,

@@ -1,11 +1,5 @@
 import { mergeWith } from 'lodash'
-import {
-    FindOperator,
-    FindOptionsRelationByString,
-    FindOptionsRelations,
-    Repository,
-    SelectQueryBuilder,
-} from 'typeorm'
+import { FindOperator, FindOptionsRelations, ObjectLiteral, Repository, SelectQueryBuilder } from 'typeorm'
 import { ColumnMetadata } from 'typeorm/metadata/ColumnMetadata'
 import { OrmUtils } from 'typeorm/util/OrmUtils'
 
@@ -85,13 +79,13 @@ export type RelationColumn<T> = Extract<
     }[Column<T>]
 >
 
-export type Order<T> = [Column<T>, 'ASC' | 'DESC']
+export type Order<T> = [Column<T> | Column<T>[], 'ASC' | 'DESC']
 export type SortBy<T> = Order<T>[]
 
 // eslint-disable-next-line @typescript-eslint/ban-types
 export type MappedColumns<T, S> = { [key in Column<T> | (string & {})]: S }
 export type JoinMethod = 'leftJoinAndSelect' | 'innerJoinAndSelect'
-export type RelationSchemaInput<T = any> = FindOptionsRelations<T> | RelationColumn<T>[] | FindOptionsRelationByString
+export type RelationSchemaInput<T = any> = FindOptionsRelations<T> | RelationColumn<T>[]
 // eslint-disable-next-line @typescript-eslint/ban-types
 export type RelationSchema<T = any> = { [relation in Column<T> | (string & {})]: true }
 
@@ -206,6 +200,19 @@ export function checkIsNestedRelation(qb: SelectQueryBuilder<unknown>, propertyP
     return true
 }
 
+export function checkIsOneOfNestedPrimaryColumns(qb: SelectQueryBuilder<unknown>, propertyPath: string): boolean {
+    let metadata = qb?.expressionMap?.mainAlias?.metadata
+    const [deepestProperty, ...subRelations] = propertyPath.split('.').reverse()
+    for (const relationName of subRelations.reverse()) {
+        const relation = metadata?.relations.find((relation) => relation.propertyPath === relationName)
+        if (!relation) {
+            return false
+        }
+        metadata = relation.inverseEntityMetadata
+    }
+    return !!metadata.primaryColumns.find((col) => col.propertyName === deepestProperty)
+}
+
 export function checkIsEmbedded(qb: SelectQueryBuilder<unknown>, propertyPath: string): boolean {
     if (!qb || !propertyPath) {
         return false
@@ -248,6 +255,13 @@ export interface JsonbPathResolution {
 }
 
 /**
+ * Column data types treated as JSON. Both `jsonb` and plain `json` are supported:
+ * `#>>` path extraction works on both, and TypeORM's `JsonContains` ($eq/$in/$contains)
+ * emits `<column> ::jsonb @> :value`, which casts a `json` column to `jsonb` for free.
+ */
+export const JSON_COLUMN_TYPES = ['jsonb', 'json']
+
+/**
  * Walks the dot-separated `column` path through TypeORM entity metadata to determine
  * whether the path terminates in a JSONB column and, if so, where the relation chain
  * ends and the JSON key path begins.
@@ -282,9 +296,9 @@ export function resolveJsonbPath(qb: SelectQueryBuilder<unknown>, column: string
             relationPath.push(segment)
             metadata = relation.inverseEntityMetadata
         } else {
-            // Not a relation — check whether it is a JSONB column
-            const isJsonbColumn = metadata?.findColumnWithPropertyName(segment)?.type === 'jsonb'
-            if (!isJsonbColumn) {
+            // Not a relation — check whether it is a JSON(B) column
+            const columnType = metadata?.findColumnWithPropertyName(segment)?.type
+            if (!JSON_COLUMN_TYPES.includes(columnType as string)) {
                 return notJsonb
             }
             return {
@@ -296,10 +310,10 @@ export function resolveJsonbPath(qb: SelectQueryBuilder<unknown>, column: string
         }
     }
 
-    // All segments except the last were relations; the last segment must be a JSONB column.
+    // All segments except the last were relations; the last segment must be a JSON(B) column.
     const lastSegment = parts[parts.length - 1]
-    const isJsonbColumn = metadata?.findColumnWithPropertyName(lastSegment)?.type === 'jsonb'
-    if (isJsonbColumn) {
+    const lastColumnType = metadata?.findColumnWithPropertyName(lastSegment)?.type
+    if (JSON_COLUMN_TYPES.includes(lastColumnType as string)) {
         return {
             isJsonb: true,
             relationPath,
@@ -460,7 +474,7 @@ export function isDateColumnType(type: any): boolean {
     return dateTypes.includes(type)
 }
 
-export function quoteVirtualColumn(columnName: string, isMySqlOrMariaDb: boolean): string {
+export function quoteColumn(columnName: string, isMySqlOrMariaDb: boolean): string {
     return isMySqlOrMariaDb ? `\`${columnName}\`` : `"${columnName}"`
 }
 
@@ -470,4 +484,94 @@ export function isNil(v: unknown): boolean {
 
 export function isNotNil(v: unknown): boolean {
     return !isNil(v)
+}
+
+export function andWhereNoneExist(
+    qb: SelectQueryBuilder<any>,
+    existsQb: SelectQueryBuilder<any>
+): SelectQueryBuilder<any> {
+    const [query, params] = qb['getExistsCondition'](existsQb)
+    return qb.andWhere(`NOT ${query}`, params)
+}
+
+/**
+ * Adds a condition to the query builder that ensures all related entities match the given filter criteria.
+ *
+ * This method combines two conditions:
+ * 1. EXISTS(X) - There must be at least one related entity matching the criteria
+ * 2. NOT EXISTS(NOT X) - There must not be any related entities that don't match the criteria
+ *
+ * Together, these conditions ensure that all related entities match the filter criteria X.
+ * For example, when filtering pillows in a cat home, this could find homes where ALL pillows are red.
+ *
+ * If you need to include cases where there are either 0 or all entities match, use $none:$not:X instead.
+ *
+ * @param {SelectQueryBuilder<any>} qb The main query builder instance to add the condition to.
+ * @param {SelectQueryBuilder<any>} existsQb The subquery builder containing the filter criteria.
+ * @return {SelectQueryBuilder<any>} The modified query builder with the combined EXISTS conditions.
+ */
+export function andWhereAllExist(
+    qb: SelectQueryBuilder<any>,
+    existsQb: SelectQueryBuilder<any>
+): SelectQueryBuilder<any> {
+    qb = qb.andWhereExists(existsQb)
+    const [query, params] = qb['getExistsCondition'](existsQb)
+    // The getExistsCondition clears anything that comes after WHERE, and our joining logic does not contain WHERE,
+    // so it should be safe to replace the first WHERE with WHERE NOT (...) and get a correct query.
+    const existsWhereNot = query.replace('WHERE', 'WHERE NOT (') + ')'
+    return qb.andWhere(`NOT ${existsWhereNot}`, params)
+}
+
+/**
+ * Strips the parts of a fully-built paginate query that do not affect how many root
+ * entities match, so the count query stays cheap even when many relations are joined
+ * for hydration.
+ *
+ * Pruning rules:
+ * - INNER joins are always kept: they restrict the result set even when unreferenced.
+ * - LEFT joins are kept only when the WHERE clause references their alias.
+ * - Parent joins of any kept join are kept, so nested relation chains stay intact.
+ * - ORDER BY is cleared, since ordering does not change the count.
+ *
+ * Used by `paginate` when `PaginateConfig.optimizedCount` is enabled. It can also be
+ * composed inside a custom `PaginateConfig.buildCountQuery`.
+ *
+ * @param {SelectQueryBuilder<T>} qb A clone of the fully-built query builder.
+ * @return {SelectQueryBuilder<T>} The same builder with count-irrelevant joins removed.
+ */
+export function buildOptimizedCountQuery<T extends ObjectLiteral>(qb: SelectQueryBuilder<T>): SelectQueryBuilder<T> {
+    qb.orderBy()
+    // Protected TypeORM API that renders only the WHERE clause. Slicing getQuery() at
+    // its first WHERE instead would false-match subqueries rendered into the SELECT
+    // clause, such as virtual columns.
+    const whereSql: string = qb['createWhereExpression']()
+
+    const joins = qb.expressionMap.joinAttributes
+    const rootAlias = qb.expressionMap.mainAlias?.name
+    const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const isReferenced = (alias: string) =>
+        whereSql.includes(`"${alias}".`) || new RegExp(`(?<![\\w"])${escapeRegExp(alias)}\\.`).test(whereSql)
+
+    const kept = new Set<string>()
+    for (const join of joins) {
+        if (join.direction === 'INNER' || isReferenced(join.alias.name)) {
+            kept.add(join.alias.name)
+        }
+    }
+
+    let added = true
+    while (added) {
+        added = false
+        for (const join of joins) {
+            if (!kept.has(join.alias.name)) continue
+            const parent = join.parentAlias
+            if (parent && parent !== rootAlias && !kept.has(parent)) {
+                kept.add(parent)
+                added = true
+            }
+        }
+    }
+
+    qb.expressionMap.joinAttributes = joins.filter((join) => kept.has(join.alias.name))
+    return qb
 }

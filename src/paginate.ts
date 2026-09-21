@@ -12,8 +12,16 @@ import {
 } from 'typeorm'
 import { WherePredicateOperator } from 'typeorm/query-builder/WhereClause'
 import { PaginateQuery } from './decorator'
-import { addFilter, FilterOperator, FilterSuffix } from './filter'
 import {
+    addFilter,
+    addFilterExpression,
+    AddFilterOptions,
+    FilterOperator,
+    FilterQuantifier,
+    FilterSuffix,
+} from './filter'
+import {
+    buildOptimizedCountQuery,
     checkIsEmbedded,
     checkIsRelation,
     Column,
@@ -36,7 +44,7 @@ import {
     mergeRelationSchema,
     Order,
     positiveNumberOrDefault,
-    quoteVirtualColumn,
+    quoteColumn,
     RelationSchema,
     RelationSchemaInput,
     resolveJsonbPath,
@@ -46,7 +54,8 @@ import globalConfig from './global-config'
 
 const logger: Logger = new Logger('nestjs-paginate')
 
-export { FilterOperator, FilterSuffix }
+export { AddFilterOptions, FilterOperator, FilterSuffix }
+export { buildOptimizedCountQuery }
 
 export class Paginated<T> {
     data: T[]
@@ -92,7 +101,7 @@ export interface PaginateConfig<T> {
     defaultSortBy?: SortBy<T>
     defaultLimit?: number
     where?: FindOptionsWhere<T> | FindOptionsWhere<T>[]
-    filterableColumns?: Partial<MappedColumns<T, (FilterOperator | FilterSuffix)[] | true>>
+    filterableColumns?: Partial<MappedColumns<T, (FilterOperator | FilterSuffix | FilterQuantifier)[] | true>>
     loadEagerRelations?: boolean
     withDeleted?: boolean
     allowWithDeletedInQuery?: boolean
@@ -105,6 +114,14 @@ export interface PaginateConfig<T> {
     defaultJoinMethod?: JoinMethod
     joinMethods?: Partial<MappedColumns<T, JoinMethod>>
     buildCountQuery?: (qb: SelectQueryBuilder<T>) => SelectQueryBuilder<any>
+    optimizedCount?: boolean
+    throwOnInvalidFilter?: boolean
+    /**
+     * Maximum number of nodes (leaves, AND/OR/NOT operators, and parenthesised groups) a
+     * single `filter=` expression may contain. Guards against denial-of-service via deeply
+     * nested or very wide expressions. Defaults to 100.
+     */
+    filterExpressionMaxComplexity?: number
 }
 
 export enum PaginationLimit {
@@ -425,7 +442,7 @@ export async function paginate<T extends ObjectLiteral>(
                 return `UNIX_TIMESTAMP(${alias}) * 1000`
             case 'postgres':
                 return `EXTRACT(EPOCH FROM ${alias}) * 1000`
-            case 'sqlite':
+            case 'better-sqlite3':
                 return `(STRFTIME('%s', ${alias}) + (STRFTIME('%f', ${alias}) - STRFTIME('%S', ${alias}))) * 1000`
             default:
                 return alias
@@ -445,7 +462,17 @@ export async function paginate<T extends ObjectLiteral>(
 
     if (query.sortBy) {
         for (const order of query.sortBy) {
-            if (isEntityKey(config.sortableColumns, order[0]) && ['ASC', 'DESC'].includes(order[1])) {
+            const [column, direction] = order
+            if (!['ASC', 'DESC'].includes(direction)) {
+                continue
+            }
+            // A polymorphic group (e.g. `colA~colB`) is valid only when every
+            // column in the group is sortable.
+            if (Array.isArray(column)) {
+                if (column.length > 0 && column.every((c) => isEntityKey(config.sortableColumns, c))) {
+                    sortBy.push(order as Order<T>)
+                }
+            } else if (isEntityKey(config.sortableColumns, column)) {
                 sortBy.push(order as Order<T>)
             }
         }
@@ -453,6 +480,13 @@ export async function paginate<T extends ObjectLiteral>(
 
     if (!sortBy.length) {
         sortBy.push(...(config.defaultSortBy || [[config.sortableColumns[0], 'ASC']]))
+    }
+
+    // Polymorphic sort groups rely on a COALESCE expression in the SELECT/ORDER BY,
+    // which cannot be encoded into a cursor token. Reject the combination explicitly
+    // rather than producing silently-wrong cursors.
+    if (config.paginationType === PaginationType.CURSOR && sortBy.some(([column]) => Array.isArray(column))) {
+        logAndThrowException('Polymorphic sort groups (using "~") are not supported with cursor pagination.')
     }
 
     const searchBy: Column<T>[] = []
@@ -587,7 +621,9 @@ export async function paginate<T extends ObjectLiteral>(
             }
 
             const cursorExpressions = sortBy.map(([column, direction]) => {
-                const columnProperties = getPropertiesByColumnName(column)
+                // Polymorphic sort groups are rejected for cursor pagination above,
+                // so every column here is a plain string.
+                const columnProperties = getPropertiesByColumnName(column as string)
                 const { isVirtualProperty, query: virtualQuery } = extractVirtualProperty(
                     queryBuilder,
                     columnProperties
@@ -663,7 +699,15 @@ export async function paginate<T extends ObjectLiteral>(
 
     let filterJoinMethods = {}
     if (query.filter) {
-        filterJoinMethods = addFilter(queryBuilder, query, config.filterableColumns)
+        filterJoinMethods = addFilter(queryBuilder, query, config.filterableColumns, {}, config.throwOnInvalidFilter)
+    }
+    if (query.filterExpression) {
+        addFilterExpression(
+            queryBuilder,
+            query.filterExpression,
+            config.filterableColumns,
+            config.filterExpressionMaxComplexity ?? globalConfig.defaultFilterExpressionMaxComplexity
+        )
     }
     const joinMethods = { ...filterJoinMethods, ...config.joinMethods }
 
@@ -674,7 +718,7 @@ export async function paginate<T extends ObjectLiteral>(
             createRelationSchema(config.relations),
             createRelationSchema(Object.keys(joinMethods))
         )
-        addRelationsFromSchema(queryBuilder, relationsSchema, config, joinMethods)
+        addRelationsFromSchema(queryBuilder, relationsSchema, joinMethods, config.defaultJoinMethod)
     }
 
     if (config.paginationType !== PaginationType.CURSOR) {
@@ -688,7 +732,61 @@ export async function paginate<T extends ObjectLiteral>(
         }
 
         for (const order of sortBy) {
-            const columnProperties = getPropertiesByColumnName(order[0])
+            const [sortColumn, sortDirection] = order
+
+            // Polymorphic sort: `colA~colB` sorts by COALESCE(colA, colB) — the first
+            // non-null value per row. The grouped columns must be type-compatible.
+            if (Array.isArray(sortColumn)) {
+                const escape = (identifier: string) => queryBuilder.connection.driver.escape(identifier)
+                const coalesceExpr = `COALESCE(${sortColumn
+                    .map((column) => {
+                        const props = getPropertiesByColumnName(column)
+                        const { isVirtualProperty } = extractVirtualProperty(queryBuilder, props)
+                        const isEmbedded = checkIsEmbedded(queryBuilder, props.propertyPath)
+                        if (isVirtualProperty || isEmbedded || resolveJsonbPath(queryBuilder, props.column).isJsonb) {
+                            logAndThrowException(
+                                `Polymorphic sort groups (using "~") support only plain and relation columns, not "${column}".`
+                            )
+                        }
+                        const isRelation = checkIsRelation(queryBuilder, props.propertyPath)
+                        // For plain and relation columns fixColumnAlias returns `<alias>.<column>`
+                        // with a single dot. Escape each identifier so camel-cased columns work
+                        // on case-folding drivers (e.g. Postgres), since this raw expression is
+                        // added to the SELECT list and is not escaped by the query builder.
+                        const ref = fixColumnAlias(
+                            props,
+                            queryBuilder.alias,
+                            isRelation,
+                            false,
+                            false,
+                            undefined,
+                            queryBuilder
+                        )
+                        const separator = ref.indexOf('.')
+                        return `${escape(ref.slice(0, separator))}.${escape(ref.slice(separator + 1))}`
+                    })
+                    .join(', ')})`
+                const polymorphAlias = `_polymorph_${sortColumn.join('_').replace(/[^a-zA-Z0-9]/g, '_')}`.toLowerCase()
+                queryBuilder.addSelect(coalesceExpr, polymorphAlias)
+
+                if (isMySqlOrMariaDb) {
+                    if (nullSort) {
+                        const selectionAliasName = `${polymorphAlias}IsNull`
+                        queryBuilder.addSelect(`${coalesceExpr} ${nullSort}`, selectionAliasName)
+                        queryBuilder.addOrderBy(selectionAliasName)
+                    }
+                    queryBuilder.addOrderBy(polymorphAlias, sortDirection)
+                } else {
+                    queryBuilder.addOrderBy(
+                        polymorphAlias,
+                        sortDirection,
+                        nullSort as 'NULLS FIRST' | 'NULLS LAST' | undefined
+                    )
+                }
+                continue
+            }
+
+            const columnProperties = getPropertiesByColumnName(sortColumn)
             const { isVirtualProperty, query: virtualQuery } = extractVirtualProperty(queryBuilder, columnProperties)
             const isRelation = checkIsRelation(queryBuilder, columnProperties.propertyPath)
             const isEmbedded = checkIsEmbedded(queryBuilder, columnProperties.propertyPath)
@@ -718,12 +816,15 @@ export async function paginate<T extends ObjectLiteral>(
                           queryBuilder
                       )
                 const vcSortAlias = isJsonbPath
-                    ? `${queryBuilder.alias}_jsonb_${columnProperties.column.replace(/[^a-zA-Z0-9]/g, '_')}_sort`.toLowerCase()
+                    ? `${queryBuilder.alias}_jsonb_${columnProperties.column.replace(
+                          /[^a-zA-Z0-9]/g,
+                          '_'
+                      )}_sort`.toLowerCase()
                     : `${alias}_vc_sort`.toLowerCase()
                 queryBuilder.addSelect(subqueryExpr, vcSortAlias)
                 alias = vcSortAlias
             } else if (isVirtualProperty) {
-                alias = quoteVirtualColumn(alias, isMySqlOrMariaDb)
+                alias = quoteColumn(alias, isMySqlOrMariaDb)
             }
 
             if (isMySqlOrMariaDb) {
@@ -834,7 +935,9 @@ export async function paginate<T extends ObjectLiteral>(
         let cols: string[] = selectParams.reduce((cols, currentCol) => {
             const columnProperties = getPropertiesByColumnName(currentCol)
             const isRelation = checkIsRelation(queryBuilder, columnProperties.propertyPath)
-            cols.push(fixColumnAlias(columnProperties, queryBuilder.alias, isRelation, false, false, undefined, queryBuilder))
+            cols.push(
+                fixColumnAlias(columnProperties, queryBuilder.alias, isRelation, false, false, undefined, queryBuilder)
+            )
             return cols
         }, [])
 
@@ -946,9 +1049,10 @@ export async function paginate<T extends ObjectLiteral>(
     if (query.limit === PaginationLimit.COUNTER_ONLY) {
         totalItems = await queryBuilder.getCount()
     } else if (isPaginated && config.paginationType !== PaginationType.CURSOR) {
-        if (config.buildCountQuery) {
+        if (config.buildCountQuery || config.optimizedCount) {
+            const buildCountQuery = config.buildCountQuery ?? buildOptimizedCountQuery
             items = await queryBuilder.getMany()
-            totalItems = await config.buildCountQuery(queryBuilder.clone()).getCount()
+            totalItems = await buildCountQuery(queryBuilder.clone()).getCount()
         } else {
             ;[items, totalItems] = await queryBuilder.getManyAndCount()
         }
@@ -1057,11 +1161,9 @@ export async function paginate<T extends ObjectLiteral>(
 export function addRelationsFromSchema<T>(
     queryBuilder: SelectQueryBuilder<T>,
     schema: RelationSchema<T>,
-    config: PaginateConfig<T>,
-    joinMethods: Partial<MappedColumns<T, JoinMethod>>
+    joinMethods: Partial<MappedColumns<T, JoinMethod>>,
+    defaultJoinMethod: 'leftJoin' | 'innerJoin' | 'leftJoinAndSelect' | 'innerJoinAndSelect' = 'leftJoinAndSelect'
 ): void {
-    const defaultJoinMethod = config.defaultJoinMethod ?? 'leftJoinAndSelect'
-
     const createQueryBuilderRelations = (
         prefix: string,
         relations: RelationSchema,
@@ -1071,7 +1173,23 @@ export function addRelationsFromSchema<T>(
         Object.keys(relations).forEach((relationName) => {
             const joinMethod =
                 joinMethods[parentRelation ? `${parentRelation}.${relationName}` : relationName] ?? defaultJoinMethod
-            queryBuilder[joinMethod](`${alias ?? prefix}.${relationName}`, `${alias ?? prefix}_${relationName}_rel`)
+            const joinAlias = `${alias ?? prefix}_${relationName}_rel`
+
+            // A prior step (e.g. a polymorphic `~` filter, which left-joins its relation parts on
+            // the main query builder before relations are loaded) may have already joined this
+            // relation under the same alias. Re-joining it duplicates the table and makes its
+            // columns ambiguous, so reuse the existing join — but still add the SELECT if this
+            // schema wants the relation hydrated (the earlier polymorphic join is unselected).
+            const alreadyJoined = queryBuilder.expressionMap.joinAttributes.some(
+                (attr) => attr.alias?.name === joinAlias
+            )
+            if (alreadyJoined) {
+                if (joinMethod === 'leftJoinAndSelect' || joinMethod === 'innerJoinAndSelect') {
+                    queryBuilder.addSelect(joinAlias)
+                }
+            } else {
+                queryBuilder[joinMethod](`${alias ?? prefix}.${relationName}`, joinAlias)
+            }
 
             // Check whether this is a non-terminal node with a relation schema to load
             const relationSchema = relations[relationName]

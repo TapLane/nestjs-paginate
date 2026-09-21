@@ -106,6 +106,7 @@ describe('Decorator', () => {
             sortBy: undefined,
             search: undefined,
             searchBy: undefined,
+            filterExpression: undefined,
             filter: undefined,
             select: undefined,
             cursor: undefined,
@@ -125,12 +126,20 @@ describe('Decorator', () => {
             sortBy: undefined,
             search: undefined,
             searchBy: undefined,
+            filterExpression: undefined,
             filter: undefined,
             select: undefined,
             cursor: undefined,
             withDeleted: undefined,
             path: 'http://localhost/items',
         })
+    })
+
+    it('should parse a bare filter= param into filterExpression', () => {
+        const context = expressContextFactory({ filter: 'color=$eq:black AND age=$gte:3' })
+        const result: PaginateQuery = decoratorfactory(null, context)
+        expect(result.filterExpression).toBe('color=$eq:black AND age=$gte:3')
+        expect(result.filter).toBeUndefined()
     })
 
     it('should handle express defined query fields', () => {
@@ -157,6 +166,7 @@ describe('Decorator', () => {
             ],
             search: 'white',
             searchBy: undefined,
+            filterExpression: undefined,
             withDeleted: true,
             select: ['name', 'createdAt'],
             path: 'http://localhost/items',
@@ -166,6 +176,19 @@ describe('Decorator', () => {
             },
             cursor: 'abc123',
         })
+    })
+
+    it('should parse polymorphic (~) sort groups into column arrays', () => {
+        const context = expressContextFactory({
+            sortBy: ['bestFriend.age~nemesis.age:ASC', 'name:DESC'],
+        })
+
+        const result: PaginateQuery = decoratorfactory(null, context)
+
+        expect(result.sortBy).toStrictEqual([
+            [['bestFriend.age', 'nemesis.age'], 'ASC'],
+            ['name', 'DESC'],
+        ])
     })
 
     it('should handle fastify defined query fields', () => {
@@ -192,6 +215,7 @@ describe('Decorator', () => {
             ],
             search: 'white',
             searchBy: undefined,
+            filterExpression: undefined,
             withDeleted: false,
             path: 'http://localhost/items',
             filter: {
@@ -223,6 +247,7 @@ describe('Decorator', () => {
             sortBy: [['NOTEXISTEN', 'BLABLA']],
             search: 'white',
             searchBy: undefined,
+            filterExpression: undefined,
             withDeleted: undefined,
             path: 'http://localhost/items',
             filter: {
