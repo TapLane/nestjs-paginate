@@ -1,0 +1,41 @@
+name: Build Artifact
+
+on:
+    push:
+        branches: [master]
+    pull_request:
+        branches: [master]
+    workflow_dispatch: {}
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+            - name: Use Node.js latest
+              uses: actions/setup-node@v4
+              with:
+                  node-version: latest
+                  cache: npm
+
+            - run: npm ci
+
+            - run: npm run build
+
+            - name: Pack npm package
+              run: npm pack
+
+            - name: Upload build output
+              uses: actions/upload-artifact@v4
+              with:
+                  name: lib
+                  path: lib/
+                  if-no-files-found: error
+
+            - name: Upload npm package tarball
+              uses: actions/upload-artifact@v4
+              with:
+                  name: nestjs-paginate-package
+                  path: '*.tgz'
+                  if-no-files-found: error
